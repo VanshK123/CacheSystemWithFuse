@@ -152,14 +152,12 @@ int cache_read_file(const char* path, char* buffer, size_t size, off_t offset) {
         return -1;
     }
     
-    // Seek to the offset
     if (lseek(fd, offset, SEEK_SET) == -1) {
         fprintf(stderr, "Failed to seek in cache file: %s\n", strerror(errno));
         close(fd);
         return -1;
     }
     
-    // Read the data
     ssize_t bytes_read = read(fd, buffer, size);
     close(fd);
     
