@@ -6,7 +6,7 @@
 #include <vector>
 #include <ctime>
 #include <memory>
-#include <sys/types.h>   // for ssize_t
+#include <sys/types.h>
 
 namespace cache_fs {
 
@@ -36,6 +36,6 @@ public:
 
 std::unique_ptr<Backend> create_backend(const std::string& url);
 
-} // namespace cache_fs
+}
 
-#endif // BACKEND_H
+#endif
