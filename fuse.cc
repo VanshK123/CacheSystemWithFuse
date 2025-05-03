@@ -1,6 +1,6 @@
 #define FUSE_USE_VERSION 30
 
-#include <fuse.h>
+#include <fuse3/fuse.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -13,8 +13,10 @@
 // I think the second tutorial is more helpful.
 
 // To compile:
-// gcc ssfs.c -o ssfs `pkg-config fuse --cflags --libs`
-// ./ssfs -f [mount point]
+// gcc fuse.cc -o fusexec `pkg-config fuse --cflags --libs`
+// ./fusexec -f ~/fuse_mount
+
+// make sure fuse_mount is a folder created in the user directory in the linux install
 
 using namespace std;
 
@@ -28,7 +30,22 @@ int currentFileIndex = -1;
 char files_content[256][256];
 int currentFileContentIndex = -1;
 
-static int getAttribute(const char* filePath, struct stat st*, struct fuse_file_info *fileInfo) {
+// gets the index of a file (for writeFile function)
+int getFileIndex(const char *filePath) {
+
+    // eliminating the slash from the root directory
+	filePath++;
+	
+	for (int i = 0; i < currentDirectoryIndex; i++) {
+		if (strcmp(filePath, files_list[i]) == 0) {
+			return i;
+        }
+    }
+	
+	return -1;
+}
+
+static int getAttribute(const char* filePath, struct stat* st, struct fuse_file_info *fileInfo) {
     // stats struct contains data about the file (size, ownership, etc.)
     // so here, we are getting a bunch of those stats
     // get user id
@@ -46,7 +63,7 @@ static int getAttribute(const char* filePath, struct stat st*, struct fuse_file_
         st->st_nlink = 2;
     } else {
         // S_IFREG means the file is a regular file
-        st->mode = S_IFREG | 0644;
+        st->st_mode = S_IFREG | 0644;
         st->st_nlink = 1;
         st->st_size = 1024;
     }
@@ -54,20 +71,20 @@ static int getAttribute(const char* filePath, struct stat st*, struct fuse_file_
     return 0;
 }
 
-static int readDirectory(const char *filePath, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fileInfo) {
+static int readDirectory(const char *filePath, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fileInfo, fuse_readdir_flags flags) {
 	
     // . is for the current directory
-	filler(buffer, ".", NULL, 0);
+	filler(buffer, ".", NULL, 0, FUSE_FILL_DIR_PLUS);
     // .. is for the parent directory
-	filler(buffer, "..", NULL, 0);
+	filler(buffer, "..", NULL, 0, FUSE_FILL_DIR_PLUS);
 	
     // if user wants to see files in root directory
-	if ( strcmp( path, "/" ) == 0 ) {
-		for (int i = 0; i <= currentDirectoryIndex; ix++) {
-			filler(buffer, directory_list[i], NULL, 0 );
+	if (strcmp(filePath, "/") == 0) {
+		for (int i = 0; i <= currentDirectoryIndex; i++) {
+			filler(buffer, directory_list[i], NULL, 0, FUSE_FILL_DIR_PLUS);
         }
 		for (int i = 0; i <= currentFileIndex; i++) {
-			filler(buffer, files_list[i], NULL, 0 );
+			filler(buffer, files_list[i], NULL, 0, FUSE_FILL_DIR_PLUS);
         }
 	}
 	
@@ -102,7 +119,7 @@ static int readDirectory(const char *filePath, void *buffer, fuse_fill_dir_t fil
 // reads data from a file
 static int readFile(const char* filePath, char *buffer, size_t size, off_t offset, struct fuse_file_info *fileInfo) {
 
-	int fileIndex = getFileIndex(path);
+	int fileIndex = getFileIndex(filePath);
 	
     if (fileIndex == -1) {
         return -1;
@@ -114,21 +131,6 @@ static int readFile(const char* filePath, char *buffer, size_t size, off_t offse
 		
 	return strlen(content) - offset;
 
-}
-
-// gets the index of a file (for writeFile function)
-int getFileIndex(const char *path) {
-
-    // eliminating the slash from the root directory
-	path++;
-	
-	for (int i = 0; i < currentDirectoryIndex; curr_idx++) {
-		if (strcmp(path, files_list[i]) == 0) {
-			return i;
-        }
-    }
-	
-	return -1;
 }
 
 // writes to a file
@@ -150,11 +152,11 @@ static int writeFile(const char *filePath, const char *buffer, size_t size, off_
 static int makeDirectory(const char *filePath, mode_t mode) {
 
     // eliminates the slash of the root directory
-    path++;
+    filePath++;
     // increment current directory
-	currentDirectory += 1;
+	currentDirectoryIndex += 1;
     // appends new directory to list of directories
-	strcpy(directory_list[currentDirectory], filePath);
+	strcpy(directory_list[currentDirectoryIndex], filePath);
 
     return 0;
 
@@ -170,7 +172,7 @@ static int makeDirectory(const char *filePath, mode_t mode) {
 static int createFile(const char *filePath, mode_t mode, dev_t rdev) {
 
     // remove slash from root directory
-    path++;
+    filePath++;
     // increment current file index
     currentFileIndex += 1;
 	strcpy(files_list[currentFileIndex], filePath);
@@ -188,18 +190,18 @@ static struct fuse_operations operations = {
     // we re-wrote these functions that are referenced in the fuse.h header file
     // for our implementation of FUSE.
     .getattr = getAttribute,
-    .readdir = readDirectory,
+    .mknod = createFile,
+    .mkdir = makeDirectory,
+    //.rmdir = removeDirecotry,
     //.open = openFile,
     .read = readFile,
     .write = writeFile,
-    .mkdir = makeDirectory,
-    //.rmdir = removeDirecotry,
-    .mknod = createFile,
+    .readdir = readDirectory,
 };
 
 int main(int argc, char* argv[]) {
 
     // call fuse_main() to begin fuse program
-    return fuse_main(argc, argv[], &operations, NULL);
+    return fuse_main(argc, argv, &operations, NULL);
 
 }
