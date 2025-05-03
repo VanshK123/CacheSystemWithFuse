@@ -1,65 +1,79 @@
+#define FUSE_USE_VERSION 30
+
 #include <iostream>
 #include <string>
-#include <fuse3/fuse.h>
+#include <memory>
+#include <cstring>
 
 #include "cache/cache_manager.h"
 #include "cache/block_store.h"
+
 #include "cache/policy/lru_policy.h"
-#include "cache/metadata/metadata_store.h"
-#include "backend/http_backend.h"
+#include "cache/policy/time_policy.h"
+
+#include "cache/policy/metadata/metadata_store.h"
+
+#include "backend/backend.h"
+
+#include "fuse/fuse.h"
 #include "fuse/fuse_ops.h"
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <mountpoint> [--cache-dir DIR] [--timeout SEC]" << std::endl;
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <mountpoint> <backend_url>" << std::endl;
         return 1;
     }
 
-    std::string mountpoint = argv[1];
-    std::string cacheDir    = "./.cache";
-    int timeout             = 3600;
-    size_t blockSize        = 4096;
-    size_t policyCapacity   = 1000;      
-    
+    const std::string mountpoint = argv[1];
+    const std::string backend_url = argv[2];
 
-    for (int i = 2; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--cache-dir" && i + 1 < argc) {
-            cacheDir = argv[++i];
-        } else if (arg == "--timeout" && i + 1 < argc) {
-            timeout = std::stoi(argv[++i]);
-        }
-    }
-
-    if (cache_init(cacheDir.c_str(), timeout) != 0) {
-        std::cerr << "Failed to initialize cache manager" << std::endl;
+    if (cache_init(mountpoint.c_str(), 3600) != 0) {
+        std::cerr << "cache_init failed on '" << mountpoint << "'" << std::endl;
         return 1;
     }
 
-    BlockStore blockStore(cacheDir + "/blocks", blockSize);
+    BlockStore blockStore(mountpoint + "/blocks", 4096);
     if (!blockStore.init()) {
-        std::cerr << "Failed to initialize block store" << std::endl;
+        std::cerr << "BlockStore::init() failed" << std::endl;
         return 1;
     }
 
-    MetadataStore metaStore(cacheDir + "/metadata.db");
+    LruPolicy  evictionPolicy(1000);
+    TimePolicy timePolicy(3600);
+
+    MetadataStore metaStore(mountpoint + "/cache_meta.db");
     if (!metaStore.init()) {
-        std::cerr << "Failed to initialize metadata store" << std::endl;
+        std::cerr << "MetadataStore::init() failed" << std::endl;
         return 1;
     }
 
-    LruPolicy evictionPolicy(policyCapacity);
+    auto backendPtr = cache_fs::create_backend(backend_url);
+    if (!backendPtr) {
+        std::cerr << "create_backend('" << backend_url << "') returned nullptr" << std::endl;
+        return 1;
+    }
+    cache_fs::Backend* httpBackend = backendPtr.get();
 
-    HttpBackend httpBackend;
+    struct fuse_operations ops;
+    std::memset(&ops, 0, sizeof(ops));
 
-    struct fuse_operations ops = {};
-    if (!init_fuse_ops(&ops, &blockStore, &evictionPolicy, &metaStore, &httpBackend)) {
-        std::cerr << "Failed to initialize FUSE operations" << std::endl;
+    if (!init_fuse_ops(&ops,
+                       &blockStore,
+                       &evictionPolicy,
+                       &timePolicy,
+                       &metaStore,
+                       httpBackend))
+    {
+        std::cerr << "init_fuse_ops() failed" << std::endl;
         return 1;
     }
 
     int ret = fuse_main(argc, argv, &ops, nullptr);
 
     cache_cleanup();
+    blockStore.cleanup();
+    metaStore.cleanup();
+
     return ret;
 }

@@ -1,4 +1,5 @@
 #include "lru_policy.h"
+#include <cstdint> 
 
 LruPolicy::LruPolicy(size_t capacity)
     : capacity_(capacity) {}

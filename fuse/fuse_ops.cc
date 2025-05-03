@@ -265,4 +265,3 @@ int fuse_fs_rename(struct fuse_fs *fs, const char *oldpath,
         return -ENOSYS;
     }
 }
-
