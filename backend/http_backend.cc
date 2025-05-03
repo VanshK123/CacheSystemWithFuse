@@ -12,13 +12,12 @@
 
 namespace cache_fs {
 
-// Helper: mkdir -p for a std::string path
 static void mkdir_p(const std::string& dir) {
     std::string so_far;
     for (size_t i = 0; i < dir.size(); ++i) {
         so_far.push_back(dir[i]);
         if (dir[i] == '/') {
-            mkdir(so_far.c_str(), 0755); // ignore errors
+            mkdir(so_far.c_str(), 0755);
         }
     }
     // final component
@@ -26,7 +25,7 @@ static void mkdir_p(const std::string& dir) {
 }
 
 class FileBackend : public Backend {
-    std::string base_dir_;  // the filesystem directory to back from
+    std::string base_dir_;
 
 public:
     int init(const std::string& base_url) override {
@@ -41,13 +40,11 @@ public:
                      size_t              size,
                      off_t               offset) override
     {
-        // 1) Try cache
         if (cache_has_valid_entry(path.c_str())) {
             ssize_t n = cache_read_file(path.c_str(), buffer, size, offset);
             if (n >= 0) return n;
         }
 
-        // 2) Read from disk
         std::string full = base_dir_ + path;
         std::ifstream ifs(full, std::ios::binary);
         if (!ifs) return -1;
@@ -55,10 +52,8 @@ public:
                               std::istreambuf_iterator<char>());
         ifs.close();
 
-        // 3) Populate cache
         cache_store_file(path.c_str(), tmp.data(), tmp.size(), 0);
 
-        // 4) Copy out requested range
         if (offset >= (off_t)tmp.size()) return 0;
         size_t avail = tmp.size() - offset;
         size_t tocopy = avail < size ? avail : size;
@@ -71,26 +66,21 @@ public:
                    size_t             size,
                    off_t              offset) override
     {
-        // 1) Write into cache
         if (cache_store_file(path.c_str(), buffer, size, offset) != 0)
             return -1;
 
-        // 2) Write-through to disk
         std::string full = base_dir_ + path;
-        // ensure parent directory
+        
         auto pos = full.find_last_of('/');
         if (pos != std::string::npos) {
             mkdir_p(full.substr(0, pos));
         }
 
-        // open (or create) and write
         std::fstream ofs(full,
                          std::ios::binary | std::ios::in | std::ios::out);
         if (!ofs) {
-            // create the file
             ofs.open(full, std::ios::binary | std::ios::out);
             ofs.close();
-            // reopen for in/out
             ofs.open(full, std::ios::binary | std::ios::in | std::ios::out);
         }
         if (!ofs) return -1;
@@ -107,4 +97,4 @@ std::unique_ptr<Backend> create_backend(const std::string& url) {
     return (b->init(url) == 0 ? std::move(b) : nullptr);
 }
 
-} // namespace cache_fs
+}
