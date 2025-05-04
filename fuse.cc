@@ -1,239 +1,209 @@
-#define FUSE_USE_VERSION 30
+#define FUSE_USE_VERSION 31
 
+// for fuse, of course
 #include <fuse3/fuse.h>
-#include <stdio.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <time.h>
+#include <fcntl.h>
+// for opening and closing directories
+#include <dirent.h>
+// for returning errors to the operating system
+#include <errno.h>
+// for string operations
 #include <string.h>
-#include <stdlib.h>
+#include <stdio.h>
 
-// First tutorial I have been following: https://www.cs.nmsu.edu/~pfeiffer/fuse-tutorial/
-// Second tutorial I have been following: https://www.maastaar.net/fuse/linux/filesystem/c/2016/05/21/writing-a-simple-filesystem-using-fuse/
-// I think the second tutorial is more helpful.
+#include <string>
+#include <mutex>
 
-// To compile:
-// gcc fuse.cc -o fusexec `pkg-config fuse --cflags --libs`
-// ./fusexec -f ~/fuse_mount
+// helpful github: https://github.com/COSI-Lab/CS444-FUSERFS/blob/master/fs.c
+// another helpful github: https://libfuse.github.io/doxygen/fuse-3_88_80_2example_2passthrough_8c.html
+// helpful for open and create: https://libfuse.github.io/doxygen/fuse-3_88_80_2example_2passthrough_8c.html
+// useful tutorial: https://www.maastaar.net/fuse/linux/filesystem/c/2016/05/21/writing-a-simple-filesystem-using-fuse/
 
-// make sure fuse_mount is a folder created in the user directory in the linux install
+static std::string backing_path;
+static std::mutex backing_lock;
 
-using namespace std;
-
-// data structures used
-char directory_list[256][256];
-int currentDirectoryIndex = -1;
-
-char files_list[256][256];
-int currentFileIndex = -1;
-
-char files_content[256][256];
-int currentFileContentIndex = -1;
-
-// gets the index of a file (for writeFile function)
-int getFileIndex(const char *filePath) {
-
-    // eliminating the slash from the root directory
-	filePath++;
-	
-	for (int i = 0; i < currentDirectoryIndex; i++) {
-		if (strcmp(filePath, files_list[i]) == 0) {
-			return i;
-        }
+// Map a FUSE path ("/foo/bar") to backing_path + "/foo/bar"
+static std::string real_path(const char *path) {
+    // check if there is a slash
+    if (strcmp(path, "/") == 0) {
+        // yes there is a slash
+        return backing_path;
     }
-	
-	return -1;
+    // makes sure there is one slash between backing_path and path
+    return backing_path + (backing_path.back()=='/' ? "" : "/") + (path[0]=='/' ? path+1 : path);
 }
 
-// determine if there is a directory
-int isDirectory(const char *filePath) {
-    
-    filePath++;
-
-    for (int currentIndex; currentIndex <= currentDirectoryIndex; currentIndex++) {
-        if (strcmp(filePath, directory_list[currentIndex]) == 0) {
-            return 1;
-        }
-    }
-
-    return 0;
-
-}
-
-// determine if there is a file
-int isFile(const char *filePath) {
-    
-    filePath++;
-
-    for(int currentIndex; currentIndex <= currentDirectoryIndex; currentIndex++) {
-        if (strcmp(filePath, files_list[currentIndex]) == 0) {
-            return 1;
-        }
-    }
-
-    return 0;
-
-}
-
-static int getAttribute(const char* filePath, struct stat* st, struct fuse_file_info *fileInfo) {
-    // stats struct contains data about the file (size, ownership, etc.)
-    // so here, we are getting a bunch of those stats
-    // get user id
-    st->st_uid = getuid();
-    // get group id
-    st->st_gid = getgid();
-    // last access time
-    st->st_atime = time(NULL);
-    // last modification time
-    st->st_mtime = time(NULL);
-
-    if (strcmp(filePath, "/") == 0 || isDirectory(filePath) == 1) {
-        // S_IFDIR means the file is a directory
-        st->st_mode = S_IFDIR | 0755;
-        st->st_nlink = 2;
-    } else if (isFile(filePath) == 1) {
-        // S_IFREG means the file is a regular file
-        st->st_mode = S_IFREG | 0644;
-        st->st_nlink = 1;
-        st->st_size = 1024;
+static int fs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
+    std::string realPath = real_path(path);
+    // get information about a file
+    if (lstat(realPath.c_str(), stbuf) == -1) {
+        // returns error
+        return -errno;
     } else {
-        return -1;
+        return 0;
     }
+}
 
+static int fs_statfs(const char *path, struct statvfs *stbuf) {
+    std::string realPath = real_path(path);
+    if (statvfs(realPath.c_str(), stbuf) == -1) {
+        // returns error
+        return -errno;
+    } else {
+        return 0;
+    }
+}
+
+static int fs_release(const char *path, struct fuse_file_info *fi) {
+    // closes out file
+    close((int)fi->fh);
     return 0;
 }
 
-static int readDirectory(const char *filePath, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fileInfo, fuse_readdir_flags flags) {
-	
-    // . is for the current directory
-	filler(buffer, ".", NULL, 0, FUSE_FILL_DIR_PLUS);
-    // .. is for the parent directory
-	filler(buffer, "..", NULL, 0, FUSE_FILL_DIR_PLUS);
-	
-    // if user wants to see files in root directory
-	if (strcmp(filePath, "/") == 0) {
-		for (int i = 0; i <= currentDirectoryIndex; i++) {
-			filler(buffer, directory_list[i], NULL, 0, FUSE_FILL_DIR_PLUS);
+static int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
+    std::string realPath = real_path(path);
+    // declare the directory
+    DIR *directoryStream = opendir(realPath.c_str());
+    // if directory is not found
+    if (!directoryStream) {
+        // returns error
+        return -errno;
+    }
+    // dirent represents a directory entry
+    struct dirent *directoryEntry;
+    while ((directoryEntry = readdir(directoryStream)) != nullptr) {
+        filler(buf, directoryEntry->d_name, nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
+    }
+    // close out directory stream
+    closedir(directoryStream);
+    return 0;
+}
+
+static int fs_mkdir(const char *path, mode_t mode) {
+    std::string realPath = real_path(path);
+    // this creates a new directory at the real path
+    if (mkdir(realPath.c_str(), mode) == -1) {
+        // returns error
+        return -errno;
+    } else {
+        return 0;
+    }
+}
+
+static int fs_rmdir(const char *path) {
+    std::string realPath = real_path(path);
+    // remove directory from real path
+    if (rmdir(realPath.c_str()) == -1) {
+        // returns error
+        return -errno;
+    } else {
+        return 0;
+    }
+}
+
+static int fs_unlink(const char *path) {
+    std::string realPath = real_path(path);
+    // remove a file
+    if (unlink(realPath.c_str()) == -1) {
+        // returns error
+        return -errno;
+    } else {
+        return 0;
+    }
+}
+
+static int fs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    std::string realPath = real_path(path);
+    // creates a file
+    int fileDirectory = open(realPath.c_str(), fi->flags | O_CREAT, mode);
+    // if unable to open the file
+    if (fileDirectory == -1) {
+        // return error
+        return -errno;
+    }
+    // add this file to the file info struct
+    fi->fh = fileDirectory;
+    return 0;
+}
+
+static int fs_open(const char *path, struct fuse_file_info *fi) {
+    std::string realPath = real_path(path);
+    // opens a file
+    int fileDirectory = open(realPath.c_str(), fi->flags);
+    if (fileDirectory == -1) {
+        // return error
+        return -errno;
+    }
+    // add this file to the file info struct
+    fi->fh = fileDirectory;
+    return 0;
+}
+
+static int fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    // read data from file
+    ssize_t res = pread((int)fi->fh, buf, size, offset);
+    if (res < 0) {
+        return -errno;
+    } else {
+        return (int)res;
+    }
+}
+
+static int fs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    // write data into file
+    ssize_t res = pwrite((int)fi->fh, buf, size, offset);
+    if (res < 0) {
+        return -errno;
+    } else {
+        return (int)res;
+    }
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        // not enough arguments
+        fprintf(stderr, "Usage: %s <backing-dir> <mountpoint> [FUSE opts]\n", argv[0]);
+        return 1;
+    }
+
+    // The following error checks adjust the path for ls, mkdir, etc. to function without error
+
+    // Resolve backing-dir to an absolute path
+    char realb[PATH_MAX];
+    if (!realpath(argv[1], realb)) {
+        perror("realpath backing-dir");
+        return 1;
+    }
+    backing_path = realb;
+
+    // Ensure it exists
+    struct stat st;
+    if (lstat(backing_path.c_str(), &st) == -1) {
+        if (mkdir(backing_path.c_str(), 0755) == -1) {
+            perror("mkdir backing-dir");
+            return 1;
         }
-		for (int i = 0; i <= currentFileIndex; i++) {
-			filler(buffer, files_list[i], NULL, 0, FUSE_FILL_DIR_PLUS);
-        }
-	}
-	
-	return 0;
-}
-
-// TO DO
-// static int openFile(const char* filePath, struct fuse_file_info *fileInfo) {
-
-//     // TUTORIAL 1 WAS HELPFUL FOR THIS
-//     int retstat = 0;
-//     int fd;
-//     char fpath[PATH_MAX];
-
-//     // generates the file path
-//     bb_fullpath(fpath, filePath);
-    
-//     // this is for logging the file path
-//     log_msg("bb_open(fpath\"%s\", fi=0x%08x)\n", fpath, (int) fileInfo);
-    
-//     fd = open(fpath, fileInfo->flags);
-//     if (fd < 0)
-// 	retstat = bb_error("bb_open open");
-    
-//     fileInfo->fh = fd;
-//     log_fi(fileInfo);
-    
-//     return retstat;
-
-// }
-
-// reads data from a file
-static int readFile(const char* filePath, char *buffer, size_t size, off_t offset, struct fuse_file_info *fileInfo) {
-
-	int fileIndex = getFileIndex(filePath);
-	
-    if (fileIndex == -1) {
-        return -1;
     }
-	
-	char *content = files_content[fileIndex];
-	
-	memcpy(buffer, content + offset, size);
-		
-	return strlen(content) - offset;
 
-}
+    // Build FUSE args: skip argv[1]
+    struct fuse_args args = FUSE_ARGS_INIT(argc-1, argv+1);
 
-// writes to a file
-static int writeFile(const char *filePath, const char *buffer, size_t size, off_t offset, struct fuse_file_info *fileInfo) {
+    static struct fuse_operations operations = {
+        .getattr  = fs_getattr,
+        .mkdir    = fs_mkdir,
+        .unlink   = fs_unlink,
+        .rmdir    = fs_rmdir,
+        .open     = fs_open,
+        .read     = fs_read,
+        .write    = fs_write,
+        .statfs   = fs_statfs,
+        .release  = fs_release,
+        .readdir  = fs_readdir,
+        .create   = fs_create,
+    };
 
-    int fileIndex = getFileIndex(filePath);
-	
-    // getFileIndex returns -1 if the file doesn't exist
-	if (fileIndex == -1) {
-		return -1;
-    }
-		
-	strcpy(files_content[fileIndex], buffer); 
-
-    return 0;
-}
-
-// makes directories in our file system
-static int makeDirectory(const char *filePath, mode_t mode) {
-
-    // eliminates the slash of the root directory
-    filePath++;
-    // increment current directory
-	currentDirectoryIndex += 1;
-    // appends new directory to list of directories
-	strcpy(directory_list[currentDirectoryIndex], filePath);
-
-    return 0;
-
-}
-
-// TO DO
-// remove directories in our file system
-// static int removeDirectory() {
-//     return 0;
-// }
-
-// making a new file
-static int createFile(const char *filePath, mode_t mode, dev_t rdev) {
-
-    // remove slash from root directory
-    filePath++;
-    // increment current file index
-    currentFileIndex += 1;
-	strcpy(files_list[currentFileIndex], filePath);
-	
-    // increment current file content index
-	currentFileContentIndex += 1;
-	strcpy(files_content[currentFileContentIndex], "");
-	
-	return 0;
-
-}
-
-static struct fuse_operations operations = {
-    // each corresponds to the above functions
-    // we re-wrote these functions that are referenced in the fuse.h header file
-    // for our implementation of FUSE.
-    .getattr = getAttribute,
-    .mknod = createFile,
-    .mkdir = makeDirectory,
-    //.rmdir = removeDirecotry,
-    //.open = openFile,
-    .read = readFile,
-    .write = writeFile,
-    .readdir = readDirectory,
-};
-
-int main(int argc, char* argv[]) {
-
-    // call fuse_main() to begin fuse program
-    return fuse_main(argc, argv, &operations, NULL);
-
+    return fuse_main(args.argc, args.argv, &operations, NULL);
 }
