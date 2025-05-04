@@ -70,6 +70,17 @@ static cache_entry* create_entry(const char* path) {
 }
 
 static int write_back_entry(cache_entry* entry) {
+
+    struct stat st;
+    if (stat(entry->local_path, &st) < 0) {
+        perror("write_back: stat local cache");
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        // not a regular file (e.g. directory), nothing to write back
+        return 0;
+    }
+
     char dst[1024];
     snprintf(dst, sizeof(dst), "%s%s", cache_directory, entry->path);
 
