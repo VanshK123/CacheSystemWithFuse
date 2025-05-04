@@ -42,16 +42,14 @@
 # 	-@rm -rf cache_dir
 
 
-# Makefile
-
 CXX       := g++
 CXXFLAGS  := -std=c++17 -Wall -Wextra
-INCLUDES  := -I./cache -I./cache/policy -I./cache/policy/metadata -I./backend
+INCLUDES  := -I. -I./cache -I./cache/policy -I./cache/policy/metadata -I./backend
 
-# Only sqlite3 now (no curl/jsoncpp)
-LIBS       := -lsqlite3
+# Libraries needed: curl + sqlite3 + threading
+LIBS      := -lcurl -lsqlite3 -pthread
 
-CACHE_SRCS := \
+CACHE_SRCS   := \
   cache/block_store.cc \
   cache/cache_manager.cc \
   cache/policy/lru_policy.cc \
@@ -60,46 +58,33 @@ CACHE_SRCS := \
 
 BACKEND_SRCS := backend/http_backend.cc
 
-TESTS      := test_cache test_eviction test_read test_http
+TESTS        := test_cache test_eviction test_read test_http
 
 .PHONY: all test clean
 
 all: $(TESTS)
 
-# Cache-only tests
 test_cache: $(CACHE_SRCS) test_cache.cc
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ $(LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -lsqlite3 -o $@
 
 test_eviction: $(CACHE_SRCS) test_eviction.cc
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ $(LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -lsqlite3 -o $@
 
 test_read: $(CACHE_SRCS) test_read.cc
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ $(LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -lsqlite3 -o $@
 
-# File-backend + cache integration
 test_http: $(CACHE_SRCS) $(BACKEND_SRCS) test_http.cc
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ $(LIBS) -o $@
 
-# Run all tests, wiping cache_dir between each
 test: all
 	@echo "=== test_cache ==="
-	-rm -rf cache_dir
-	@./test_cache
-
-	@echo ""
-	@echo "=== test_eviction ==="
-	-rm -rf cache_dir
-	@./test_eviction
-
-	@echo ""
-	@echo "=== test_read ==="
-	-rm -rf cache_dir
-	@./test_read
-
-	@echo ""
-	@echo "=== test_http ==="
-	-rm -rf cache_dir
-	@./test_http
+	-rm -rf cache_dir; ./test_cache
+	@echo "\n=== test_eviction ==="
+	-rm -rf cache_dir; ./test_eviction
+	@echo "\n=== test_read ==="
+	-rm -rf cache_dir; ./test_read
+	@echo "\n=== test_http ==="
+	-rm -rf cache_dir; ./test_http
 
 clean:
 	-rm -f $(TESTS)
