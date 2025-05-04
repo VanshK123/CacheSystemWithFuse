@@ -45,6 +45,36 @@ int getFileIndex(const char *filePath) {
 	return -1;
 }
 
+// determine if there is a directory
+int isDirectory(const char *filePath) {
+    
+    filePath++;
+
+    for (int currentIndex; currentIndex <= currentDirectoryIndex; currentIndex++) {
+        if (strcmp(filePath, directory_list[currentIndex]) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+
+}
+
+// determine if there is a file
+int isFile(const char *filePath) {
+    
+    filePath++;
+
+    for(int currentIndex; currentIndex <= currentDirectoryIndex; currentIndex++) {
+        if (strcmp(filePath, files_list[currentIndex]) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+
+}
+
 static int getAttribute(const char* filePath, struct stat* st, struct fuse_file_info *fileInfo) {
     // stats struct contains data about the file (size, ownership, etc.)
     // so here, we are getting a bunch of those stats
@@ -57,15 +87,17 @@ static int getAttribute(const char* filePath, struct stat* st, struct fuse_file_
     // last modification time
     st->st_mtime = time(NULL);
 
-    if (strcmp(filePath, "/") == 0) {
+    if (strcmp(filePath, "/") == 0 || isDirectory(filePath) == 1) {
         // S_IFDIR means the file is a directory
         st->st_mode = S_IFDIR | 0755;
         st->st_nlink = 2;
-    } else {
+    } else if () {
         // S_IFREG means the file is a regular file
         st->st_mode = S_IFREG | 0644;
         st->st_nlink = 1;
         st->st_size = 1024;
+    } else {
+        return -ENOENT;
     }
 
     return 0;
