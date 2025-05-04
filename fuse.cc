@@ -91,13 +91,13 @@ static int getAttribute(const char* filePath, struct stat* st, struct fuse_file_
         // S_IFDIR means the file is a directory
         st->st_mode = S_IFDIR | 0755;
         st->st_nlink = 2;
-    } else if () {
+    } else if (isFile(filePath) == 1) {
         // S_IFREG means the file is a regular file
         st->st_mode = S_IFREG | 0644;
         st->st_nlink = 1;
         st->st_size = 1024;
     } else {
-        return -ENOENT;
+        return -1;
     }
 
     return 0;
