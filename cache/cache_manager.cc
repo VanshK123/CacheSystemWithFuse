@@ -16,6 +16,9 @@
 #include <unordered_map>
 #include <sys/types.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 
 namespace fs = std::filesystem;
 
@@ -81,6 +84,15 @@ ssize_t CacheManager::read(const std::string& path, char* buf, std::size_t len, 
         bool cached = store_.read(ce.hash_hex, block,kBlockSize, blk_off) == static_cast<ssize_t>(kBlockSize);
         if (!cached) {
             ssize_t got = cache_fs::backend_read_range(path, block, kBlockSize, blk_off);
+            if (got <= 0) {
+                fs::path src = fs::path(root_) /
+                            fs::path(path[0] == '/' ? path.substr(1) : path);
+                int fd = ::open(src.c_str(), O_RDONLY);
+                if (fd >= 0) {
+                    got = ::pread(fd, block, kBlockSize, blk_off);
+                    ::close(fd);
+                }
+            }
             if (got <= 0) return (done ? done : -1);
             store_.write(ce.hash_hex, block, got, blk_off, false);
         }
@@ -96,28 +108,44 @@ ssize_t CacheManager::read(const std::string& path, char* buf, std::size_t len, 
     return done;
 }
 
-ssize_t CacheManager::write(const std::string& path, const char* buf, std::size_t len, off_t off) {
+ssize_t CacheManager::write(const std::string& path, const char* buf, std::size_t len, off_t off)
+{
     std::lock_guard<std::mutex> g(mu_);
     CacheEntry& ce = entry(path);
     if (ce.evicted) return -ENOENT;
 
-    std::size_t done = 0;
-    while (done < len) {
-        std::size_t blk = (off + done) / kBlockSize;
-        off_t blk_off   = blk * kBlockSize;
-        std::size_t in  = (off + done) - blk_off;
-        std::size_t chunk = std::min<std::size_t>(kBlockSize - in, len - done);
+    int dst_fd = -1;
+    auto ensure_dst = [&] {
+    if (dst_fd != -1) return;
+    fs::path dst = fs::path(root_) /
+    fs::path(path[0] == '/' ? path.substr(1) : path);
+    fs::create_directories(dst.parent_path());
+    dst_fd = ::open(dst.c_str(), O_RDWR | O_CREAT, 0644);
+};
 
-        char block[kBlockSize]{};
-        store_.read(ce.hash_hex, block, kBlockSize, blk_off);
-        std::memcpy(block + in, buf + done, chunk);
-        store_.write(ce.hash_hex, block, kBlockSize, blk_off, true);
+std::size_t done = 0;
+while (done < len) {
+std::size_t blk  = (off + done) / kBlockSize;
+off_t       boff = blk * kBlockSize;
+std::size_t in   = (off + done) - boff;
+std::size_t chunk= std::min<std::size_t>(kBlockSize - in, len - done);
 
-        meta_.markDirtyBlock(ce.hash_hex, blk_off / fs_layout::kMaxPartSize, blk);
-        lru_.touch(reinterpret_cast<std::uintptr_t>(&ce)<<32 | blk, kBlockSize, 1.0);
-        done += chunk;
-    }
-    return done;
+char block[kBlockSize]{};
+store_.read(ce.hash_hex, block, kBlockSize, boff);
+std::memcpy(block + in, buf + done, chunk);
+store_.write(ce.hash_hex, block, kBlockSize, boff, true);
+
+meta_.markDirtyBlock(ce.hash_hex, boff / fs_layout::kMaxPartSize, blk);
+lru_.touch(reinterpret_cast<std::uintptr_t>(&ce)<<32 | blk,
+kBlockSize, 1.0);
+
+ensure_dst();
+::pwrite(dst_fd, buf + done, chunk, off + done);
+
+done += chunk;
+}
+if (dst_fd != -1) ::close(dst_fd);
+return done;
 }
 
 void CacheManager::flush_all() {
@@ -177,11 +205,15 @@ int cache_init(const char* root, int) {
     try { g_cache = std::make_unique<CacheManager>(root); return 0; }
     catch (...) { return -1; }
 }
-ssize_t cache_read_file(const char* p, char* b, size_t n, off_t o) {
-    return g_cache ? g_cache->read(p, b, n, o) : -ENODEV;
+int cache_store_file(const char* p, const char* d, size_t len, off_t off)
+{
+    if (!g_cache) return -ENODEV;
+    ssize_t rc = g_cache->write(p, d, len, off);
+    return (rc < 0) ? static_cast<int>(rc) : 0;
 }
-int cache_store_file(const char* p, const char* d, size_t n, off_t o) {
-    return g_cache ? g_cache->write(p, d, n, o) : -ENODEV;
+ssize_t cache_read_file(const char* p, char* b, size_t len, off_t off)
+{
+    return g_cache ? g_cache->read(p, b, len, off) : -ENODEV;
 }
 int cache_evict_gb(double gb) {
     if (!g_cache) return -ENODEV;
