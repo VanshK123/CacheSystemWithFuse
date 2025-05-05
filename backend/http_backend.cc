@@ -1,131 +1,184 @@
-// backend/http_backend.cc
-
 #include "backend/backend.h"
-#include "cache/cache_manager.h"
 #include <curl/curl.h>
-#include <string>
-#include <cstring>
-#include <vector>
 #include <algorithm>
+#include <cstring>
+#include <filesystem>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 namespace cache_fs {
 
-// Liquid‐buffer for libcurl GET
-struct CurlBuffer {
-    char*  data;
-    size_t size;
-    CurlBuffer(): data((char*)malloc(1)), size(0) {}
-    ~CurlBuffer() { free(data); }
+namespace {
+
+struct SliceWriter {
+char*  dst;
+size_t cap;
+size_t pos;
 };
-static size_t write_cb(void* ptr, size_t sz, size_t nm, void* ud) {
-    size_t realsz = sz * nm;
-    CurlBuffer* buf = (CurlBuffer*)ud;
-    char* p = (char*)realloc(buf->data, buf->size + realsz + 1);
-    if (!p) return 0;
-    buf->data = p;
-    memcpy(buf->data + buf->size, ptr, realsz);
-    buf->size += realsz;
-    buf->data[buf->size] = '\0';
-    return realsz;
+size_t write_slice_cb(void* ptr, size_t sz, size_t nm, void* ud) {
+size_t n   = sz * nm;
+auto*  sw  = static_cast<SliceWriter*>(ud);
+size_t cpy = std::min(n, sw->cap - sw->pos);
+if (cpy) {
+    memcpy(sw->dst + sw->pos, ptr, cpy);
+    sw->pos += cpy;
+}
+return n;
 }
 
-// Upload‐buffer for libcurl PUT
-struct UploadBuffer {
-    const char* data;
-    size_t      pos;
-    size_t      total;
-    UploadBuffer(const char* d, size_t t): data(d), pos(0), total(t) {}
+struct UploadBuf {
+const char* data;
+size_t      total;
+size_t      pos;
 };
-static size_t read_cb(void* ptr, size_t sz, size_t nm, void* ud) {
-    UploadBuffer* up = (UploadBuffer*)ud;
-    size_t avail = up->total - up->pos;
-    size_t tocopy = std::min(avail, sz * nm);
-    if (tocopy) {
-        memcpy(ptr, up->data + up->pos, tocopy);
-        up->pos += tocopy;
-    }
-    return tocopy;
+
+#ifdef ENABLE_PUT
+size_t read_upload_cb(char* ptr, size_t sz, size_t nm, void* ud) {
+auto* up = static_cast<UploadBuf*>(ud);
+size_t avail = up->total - up->pos;
+size_t cpy   = std::min(avail, sz * nm);
+if (cpy) {
+    memcpy(ptr, up->data + up->pos, cpy);
+    up->pos += cpy;
+}
+return cpy;
+}
+#endif
+
 }
 
 class HttpBackend : public Backend {
-    std::string base_url_;
 public:
-    int init(const std::string& url) override {
-        base_url_ = url;
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-        return 0;
+int init(const std::string& url, const std::string& bearer_token = "") override {
+    base_url_     = url;
+    bearer_token_ = bearer_token;
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    return 0;
+}
+
+ssize_t download(const std::string& path, char* buffer, std::size_t size, off_t offset) override {
+    CURL* curl = curl_easy_init();
+    if (!curl) return -1;
+
+    std::string url = base_url_ + path;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+
+    std::string range = "Range: bytes=" + std::to_string(offset) + "-" + std::to_string(offset + size - 1);
+    struct curl_slist* hdrs = nullptr;
+    hdrs = curl_slist_append(hdrs, range.c_str());
+    if (!bearer_token_.empty()) {
+        std::string auth = "Authorization: Bearer " + bearer_token_;
+        hdrs = curl_slist_append(hdrs, auth.c_str());
     }
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
 
-    ssize_t download(const std::string& path,
-                     char*               buffer,
-                     size_t              size,
-                     off_t               offset) override
-    {
-        // 1) Cache hit?
-        if (cache_has_valid_entry(path.c_str())) {
-            ssize_t n = cache_read_file(path.c_str(), buffer, size, offset);
-            if (n >= 0) return n;
-        }
-        // 2) HTTP GET
-        CURL* curl = curl_easy_init();
-        if (!curl) return -1;
-        std::string url = base_url_ + path;
-        CurlBuffer chunk;
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);
-        if (curl_easy_perform(curl) != CURLE_OK) {
-            curl_easy_cleanup(curl);
-            return -1;
-        }
-        curl_easy_cleanup(curl);
+    SliceWriter sw{buffer, size, 0};
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_slice_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sw);
 
-        // 3) Populate cache
-        cache_store_file(path.c_str(), chunk.data, chunk.size, 0);
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
 
-        // 4) Copy out requested slice
-        if (offset >= (off_t)chunk.size) return 0;
-        size_t avail = chunk.size - offset;
-        size_t tocopy = std::min(avail, size);
-        memcpy(buffer, chunk.data + offset, tocopy);
-        return (ssize_t)tocopy;
+    return (res == CURLE_OK) ? static_cast<ssize_t>(sw.pos) : -1;
+}
+
+ssize_t upload(const std::string& path, const char* buffer, std::size_t size, off_t offset) override {
+#ifndef ENABLE_PUT
+    (void)path; 
+    (void)buffer; 
+    (void)size; 
+    (void)offset;
+    return -ENOSYS;
+#else
+    CURL* curl = curl_easy_init();
+    if (!curl) return -1;
+
+    std::string url = base_url_ + path;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+
+    std::string rng = "Content-Range: bytes " + std::to_string(offset) + "-" + std::to_string(offset + size - 1) + "/*";
+    struct curl_slist* hdrs = nullptr;
+    hdrs = curl_slist_append(hdrs, rng.c_str());
+    if (!bearer_token_.empty()) {
+        std::string auth = "Authorization: Bearer " + bearer_token_;
+        hdrs = curl_slist_append(hdrs, auth.c_str());
     }
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
 
-    ssize_t upload(const std::string& path,
-                   const char*        buffer,
-                   size_t             size,
-                   off_t              offset) override
-    {
-        // 1) Cache write
-        if (cache_store_file(path.c_str(), buffer, size, offset) != 0)
-            return -1;
+    UploadBuf up{buffer, size, 0};
+    curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_upload_cb);
+    curl_easy_setopt(curl, CURLOPT_READDATA, &up);
+    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(size));
 
-        // 2) Read full object
-        cache_entry* e = cache_get_entry(path.c_str());
-        if (!e) return -1;
-        std::vector<char> full(e->size);
-        if (cache_read_file(path.c_str(), full.data(), e->size, 0) < 0)
-            return -1;
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return (res == CURLE_OK) ? static_cast<ssize_t>(size) : -1;
+#endif
+}
 
-        // 3) HTTP PUT
-        CURL* curl = curl_easy_init();
-        if (!curl) return -1;
-        std::string url = base_url_ + path;
-        UploadBuffer up(full.data(), full.size());
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-        curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_cb);
-        curl_easy_setopt(curl, CURLOPT_READDATA, &up);
-        curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)full.size());
-        CURLcode res = curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-        return (res == CURLE_OK) ? (ssize_t)size : -1;
+int remove(const std::string& path) override {
+#ifndef ENABLE_PUT
+    (void)path;
+    return -ENOSYS;
+#else
+    CURL* curl = curl_easy_init();
+    if (!curl) return -1;
+    std::string url = base_url_ + path;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    if (!bearer_token_.empty()) {
+        std::string auth = "Authorization: Bearer " + bearer_token_;
+        struct curl_slist* hdrs = nullptr;
+        hdrs = curl_slist_append(hdrs, auth.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     }
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    return (res == CURLE_OK) ? 0 : -1;
+#endif
+}
+
+private:
+std::string base_url_;
+std::string bearer_token_;
 };
+
+static std::mutex                        g_mtx;
+static std::unique_ptr<Backend>          g_backend;
+static Backend*                          g_backend_raw = nullptr;
 
 std::unique_ptr<Backend> create_backend(const std::string& url) {
     auto b = std::make_unique<HttpBackend>();
-    return (b->init(url) == 0) ? std::move(b) : nullptr;
+    if (b->init(url) != 0) return nullptr;
+
+    std::lock_guard lk(g_mtx);
+    g_backend      = std::move(b);
+    g_backend_raw  = g_backend.get();
+    return std::unique_ptr<Backend>(g_backend_raw);
 }
 
-} // namespace cache_fs
+ssize_t backend_read_range(const std::string& path, char* buf, std::size_t len, off_t off) {
+    std::lock_guard lk(g_mtx);
+    if (!g_backend_raw) return -ENODEV;
+    return g_backend_raw->download(path, buf, len, off);
+}
+
+ssize_t backend_put_range(const std::string& path, const char* buf, std::size_t len, off_t off) {
+    std::lock_guard lk(g_mtx);
+    if (!g_backend_raw) return -ENODEV;
+    return g_backend_raw->upload(path, buf, len, off);
+}
+
+int backend_delete(const std::string& path) {
+    std::lock_guard lk(g_mtx);
+    if (!g_backend_raw) return -ENODEV;
+    return g_backend_raw->remove(path);
+}
+
+}

@@ -1,29 +1,32 @@
-#ifndef BLOCK_STORE_H
-#define BLOCK_STORE_H
+#ifndef CACHE_BLOCK_STORE_H
+#define CACHE_BLOCK_STORE_H
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <sys/types.h>
 
 class BlockStore {
 public:
-    BlockStore(const std::string& storage_dir, size_t block_size);
-    ~BlockStore();
 
-    bool init();
+BlockStore(const std::string& cache_root, std::size_t block_size);
 
-    ssize_t read_block(size_t block_id, char* buffer);
+bool init();
 
-    bool write_block(size_t block_id, const char* buffer);
+ssize_t read(const std::string& hash_hex, char* buf, std::size_t len,  off_t off);
 
-    bool delete_block(size_t block_id);
+ssize_t write(const std::string& hash_hex, const char* buf, std::size_t len, off_t off, bool mark_dirty);
 
-    bool has_block(size_t block_id);
+bool delete_object(const std::string& hash_hex);
 
-    void cleanup();
+void cleanup();
 
 private:
-    std::string storage_dir_;
-    size_t      block_size_;
+std::string root_; 
+std::size_t block_size_;
+
+BlockStore(const BlockStore&)            = delete;
+BlockStore& operator=(const BlockStore&) = delete;
 };
 
 #endif

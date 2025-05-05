@@ -1,5 +1,5 @@
-#ifndef LRU_POLICY_H
-#define LRU_POLICY_H
+#ifndef CACHE_POLICY_LRU_POLICY_H
+#define CACHE_POLICY_LRU_POLICY_H
 
 #include <cstddef>
 #include <list>
@@ -7,18 +7,32 @@
 
 class LruPolicy {
 public:
-    LruPolicy(size_t capacity);
+    explicit LruPolicy(std::size_t capacity);
 
-    void touch(size_t blockId);
+    void touch(std::size_t blockId, std::size_t bytes, double hotness);
 
-    void remove(size_t blockId);
+    void remove(std::size_t blockId);
 
-    size_t evict();
+    std::size_t evict();
 
 private:
-    size_t capacity_;  
-    std::list<size_t> order_;
-    std::unordered_map<size_t, std::list<size_t>::iterator> map_;
+    struct Node {
+        std::size_t id;
+        std::size_t bytes;
+        double      hotness;
+    };
+
+    static inline double score(const Node& n) {
+        return n.bytes * (1.0 - n.hotness);
+    }
+
+    std::size_t capacity_;
+    std::list<Node> order_;
+    std::unordered_map<std::size_t,
+        std::list<Node>::iterator> map_;
+
+    LruPolicy(const LruPolicy&)            = delete;
+    LruPolicy& operator=(const LruPolicy&) = delete;
 };
 
 #endif
