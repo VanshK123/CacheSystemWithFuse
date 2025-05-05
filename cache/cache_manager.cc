@@ -1,308 +1,196 @@
-#include "cache_manager.h"
-#include <stdio.h>
-#include <string.h>
-#include <sys/stat.h>
+#include "block_store.h"
+#include "metadata_store.h"
+#include "lru_policy.h"
+#include "thread_pool.h"
+#include "backend/backend.h"
+#include "fs_layout.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <iomanip>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <unordered_map>
 #include <sys/types.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <time.h>
-#include <libgen.h>
 
-#define CACHE_HASH_SIZE   CACHE_TABLE_SIZE
-#define COPY_BUFFER_SIZE  4096
+namespace fs = std::filesystem;
 
-static char*        cache_directory = NULL;
-static int          cache_timeout   = 3600;
-static cache_entry* cache_table[CACHE_HASH_SIZE] = { nullptr };
+#ifndef PREFETCH_WINDOW
+#define PREFETCH_WINDOW 4
+#endif
+static constexpr std::size_t kBlockSize = 64 * 1024;
+static constexpr std::size_t kCacheBlocksCapacity = 200'000;
 
-static unsigned int hash_path(const char* path) {
-    unsigned int hash = 5381;
-    int c;
-    while ((c = *path++))
-        hash = ((hash << 5) + hash) + c;
-    return hash % CACHE_HASH_SIZE;
+static std::string hash_hex(const std::string& s) {
+    std::size_t h = std::hash<std::string>{}(s);
+    std::ostringstream oss;
+    oss << std::hex << std::setw(16) << std::setfill('0') << h;
+    return oss.str();
 }
 
-static int mkdir_p(const char *path) {
-    char tmp[1024];
-    char *p;
-    size_t len;
+struct CacheEntry {
+    std::string path;
+    std::string hash_hex;
+    std::size_t last_block = std::numeric_limits<std::size_t>::max();
+    bool evicted    = false;
+};
 
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    len = strlen(tmp);
-    if (len == 0) return -1;
-    if (tmp[len-1] == '/') tmp[len-1] = '\0';
+class CacheManager {
+public:
+    explicit CacheManager(const std::string& root) : store_(root, kBlockSize), meta_("cache_meta.db", root), lru_(kCacheBlocksCapacity), prefetch_pool_(4), root_(root) {
+        store_.init();
+        meta_.init();
+    }
 
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(tmp, 0755);
-            *p = '/';
+    ssize_t read(const std::string& path, char* buf, std::size_t len, off_t off);
+
+    ssize_t write(const std::string& path, const char* buf, std::size_t len, off_t off);
+    void   flush_all();
+    void   evict_until_gb(double free_gb);
+
+private:
+    CacheEntry& entry(const std::string& path);
+    void schedule_prefetch(CacheEntry ce, std::size_t first_blk);
+
+    std::mutex mu_;
+    BlockStore store_;
+    MetadataStore meta_;
+    LruPolicy lru_;
+    ThreadPool prefetch_pool_;
+    std::unordered_map<std::string, CacheEntry> entries_;
+    std::string root_;
+};
+
+ssize_t CacheManager::read(const std::string& path, char* buf, std::size_t len, off_t off) {
+    std::lock_guard<std::mutex> g(mu_);
+    CacheEntry& ce = entry(path);
+    if (ce.evicted) return -ENOENT;
+
+    ssize_t done = 0;
+    while (done < static_cast<ssize_t>(len)) {
+        std::size_t blk = (off + done) / kBlockSize;
+        off_t blk_off   = blk * kBlockSize;
+        std::size_t in  = (off + done) - blk_off;
+        std::size_t want= std::min<std::size_t>(kBlockSize - in, len - done);
+
+        char block[kBlockSize];
+        bool cached = store_.read(ce.hash_hex, block,kBlockSize, blk_off) == static_cast<ssize_t>(kBlockSize);
+        if (!cached) {
+            ssize_t got = cache_fs::backend_read_range(path, block, kBlockSize, blk_off);
+            if (got <= 0) return (done ? done : -1);
+            store_.write(ce.hash_hex, block, got, blk_off, false);
         }
+        std::memcpy(buf + done, block + in, want);
+        done += want;
+
+        lru_.touch(reinterpret_cast<std::uintptr_t>(&ce)<<32 | blk, kBlockSize, 1.0);
+
+        bool seq = (ce.last_block != std::numeric_limits<std::size_t>::max()) && (blk == ce.last_block + 1);
+        ce.last_block = blk;
+        if (seq) schedule_prefetch(ce, blk + 1);
     }
-    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-        return -1;
-    }
-    return 0;
+    return done;
 }
 
-static cache_entry* create_entry(const char* path) {
-    cache_entry* e = (cache_entry*)malloc(sizeof(cache_entry));
-    if (!e) return nullptr;
+ssize_t CacheManager::write(const std::string& path, const char* buf, std::size_t len, off_t off) {
+    std::lock_guard<std::mutex> g(mu_);
+    CacheEntry& ce = entry(path);
+    if (ce.evicted) return -ENOENT;
 
-    e->path = strdup(path);
+    std::size_t done = 0;
+    while (done < len) {
+        std::size_t blk = (off + done) / kBlockSize;
+        off_t blk_off   = blk * kBlockSize;
+        std::size_t in  = (off + done) - blk_off;
+        std::size_t chunk = std::min<std::size_t>(kBlockSize - in, len - done);
 
-    unsigned int h = hash_path(path);
-    char lp[1024];
-    snprintf(lp, sizeof(lp), "%s/%u_%s",
-             cache_directory,
-             h,
-             strrchr(path,'/')?strrchr(path,'/')+1:path);
+        char block[kBlockSize]{};
+        store_.read(ce.hash_hex, block, kBlockSize, blk_off);
+        std::memcpy(block + in, buf + done, chunk);
+        store_.write(ce.hash_hex, block, kBlockSize, blk_off, true);
 
-    e->local_path     = strdup(lp);
-    e->size           = 0;
-    e->timestamp      = time(NULL);
-    e->last_accessed  = e->timestamp;
-    e->dirty          = false;
-    e->next           = nullptr;
-    return e;
+        meta_.markDirtyBlock(ce.hash_hex, blk_off / fs_layout::kMaxPartSize, blk);
+        lru_.touch(reinterpret_cast<std::uintptr_t>(&ce)<<32 | blk, kBlockSize, 1.0);
+        done += chunk;
+    }
+    return done;
 }
 
-static int write_back_entry(cache_entry* entry) {
-
-    struct stat st;
-    if (stat(entry->local_path, &st) < 0) {
-        perror("write_back: stat local cache");
-        return -1;
-    }
-    if (!S_ISREG(st.st_mode)) {
-        // not a regular file (e.g. directory), nothing to write back
-        return 0;
-    }
-
-    char dst[1024];
-    snprintf(dst, sizeof(dst), "%s%s", cache_directory, entry->path);
-
-    char* dup = strdup(dst);
-    char* dir = dirname(dup);
-    mkdir_p(dir);
-    free(dup);
-
-    int fd_src = open(entry->local_path, O_RDONLY);
-    if (fd_src < 0) {
-        perror("write_back: open local cache");
-        return -1;
-    }
-    int fd_dst = open(dst, O_WRONLY | O_CREAT, 0644);
-    if (fd_dst < 0) {
-        perror("write_back: open backing store");
-        close(fd_src);
-        return -1;
-    }
-    char buf[COPY_BUFFER_SIZE];
-    ssize_t n;
-    while ((n = read(fd_src, buf, sizeof(buf))) > 0) {
-        if (write(fd_dst, buf, n) != n) {
-            perror("write_back: write");
-            close(fd_src);
-            close(fd_dst);
-            return -1;
-        }
-    }
-    close(fd_src);
-    close(fd_dst);
-    if (n < 0) perror("write_back: read");
-    return (n < 0 ? -1 : 0);
+void CacheManager::flush_all() {
+    std::lock_guard<std::mutex> g(mu_);
+    for (auto& [_, ce] : entries_) meta_.flushBitmaps(ce.hash_hex);
 }
 
-static int populate_from_backing(cache_entry* entry) {
-    char src[1024];
-    snprintf(src, sizeof(src), "%s%s", cache_directory, entry->path);
-
-    int fd_src = open(src, O_RDONLY);
-    if (fd_src < 0) {
-        perror("cache_read_file: open backing store");
-        return -1;
+void CacheManager::evict_until_gb(double free_gb) {
+    auto used_gb = [&] {
+        std::uintmax_t bytes = 0;
+        for (auto& f : fs::recursive_directory_iterator(root_))
+            if (f.is_regular_file()) bytes += f.file_size();
+        return double(bytes)/(1024.0*1024.0*1024.0);
+    };
+    while (used_gb() > free_gb) {
+        std::uintptr_t key = lru_.evict();
+        if (key == std::numeric_limits<std::uintptr_t>::max()) break;
+        auto* ce = reinterpret_cast<CacheEntry*>(key >> 32);
+        if (!ce || ce->evicted) continue;
+        store_.delete_object(ce->hash_hex);
+        meta_.flushBitmaps(ce->hash_hex);
+        ce->evicted = true;
     }
-    int fd_dst = open(entry->local_path,
-                      O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd_dst < 0) {
-        perror("cache_read_file: create local cache");
-        close(fd_src);
-        return -1;
-    }
-
-    char buf[COPY_BUFFER_SIZE];
-    ssize_t n, total = 0;
-    while ((n = read(fd_src, buf, sizeof(buf))) > 0) {
-        if (write(fd_dst, buf, n) != n) {
-            perror("cache_read_file: write cache");
-            close(fd_src);
-            close(fd_dst);
-            return -1;
-        }
-        total += n;
-    }
-    if (n < 0) perror("cache_read_file: read backing");
-    close(fd_src);
-    close(fd_dst);
-
-    entry->dirty = false;
-    entry->size  = (size_t)total;
-    return (n < 0 ? -1 : 0);
 }
 
-int cache_init(const char* backing_dir, int timeout) {
-    cache_directory = strdup(backing_dir);
-    cache_timeout   = timeout;
-
-    struct stat st{};
-    if (stat(cache_directory, &st) == -1) {
-        if (mkdir_p(cache_directory) != 0) {
-            perror("cache_init: mkdir_p");
-            return -1;
-        }
-    }
-    for (int i = 0; i < CACHE_HASH_SIZE; ++i)
-        cache_table[i] = nullptr;
-    return 0;
+CacheEntry& CacheManager::entry(const std::string& path) {
+    auto it = entries_.find(path);
+    if (it != entries_.end()) return it->second;
+    CacheEntry ce{path, hash_hex(path)};
+    return entries_.emplace(path, std::move(ce)).first->second;
 }
 
-bool cache_has_valid_entry(const char* path) {
-    unsigned int h = hash_path(path);
-    cache_entry* e = cache_table[h];
-    time_t now = time(NULL);
-    while (e) {
-        if (strcmp(e->path, path) == 0) {
-            return difftime(now, e->last_accessed) <= cache_timeout;
-        }
-        e = e->next;
-    }
-    return false;
-}
-
-cache_entry* cache_get_entry(const char* path) {
-    unsigned int h = hash_path(path);
-    cache_entry* e = cache_table[h];
-    while (e) {
-        if (strcmp(e->path, path) == 0) {
-            e->last_accessed = time(NULL);
-            return e;
-        }
-        e = e->next;
-    }
-    return nullptr;
-}
-
-int cache_store_file(const char* path,
-                     const char* data,
-                     size_t       size,
-                     off_t        offset)
-{
-    unsigned int h = hash_path(path);
-    cache_entry* e = cache_get_entry(path);
-    if (!e) {
-        e = create_entry(path);
-        if (!e) return -1;
-        e->next = cache_table[h];
-        cache_table[h] = e;
-    }
-
-    int fd = open(e->local_path, O_RDWR | O_CREAT, 0644);
-    if (fd < 0) {
-        perror("cache_store_file: open");
-        return -1;
-    }
-    if (lseek(fd, offset, SEEK_SET) < 0) {
-        perror("cache_store_file: lseek");
-        close(fd);
-        return -1;
-    }
-    if (write(fd, data, size) != (ssize_t)size) {
-        perror("cache_store_file: write");
-        close(fd);
-        return -1;
-    }
-    close(fd);
-
-    e->size           = offset + size;
-    e->dirty          = true;
-    e->last_accessed  = time(NULL);
-    return 0;
-}
-
-ssize_t cache_read_file(const char* path,
-                        char*        buffer,
-                        size_t       size,
-                        off_t        offset)
-{
-    unsigned int h = hash_path(path);
-    cache_entry* e = cache_get_entry(path);
-    if (!e) {
-        e = create_entry(path);
-        if (!e) return -1;
-        e->next = cache_table[h];
-        cache_table[h] = e;
-        if (populate_from_backing(e) != 0) {
-            return -1;
-        }
-    }
-
-    int fd = open(e->local_path, O_RDONLY);
-    if (fd < 0) {
-        perror("cache_read_file: open cache");
-        return -1;
-    }
-    if (lseek(fd, offset, SEEK_SET) < 0) {
-        perror("cache_read_file: lseek");
-        close(fd);
-        return -1;
-    }
-    ssize_t n = read(fd, buffer, size);
-    if (n < 0) perror("cache_read_file: read");
-    e->last_accessed = time(NULL);
-    close(fd);
-    return n;
-}
-
-int cache_apply_eviction(void) {
-    time_t now = time(NULL);
-    for (int i = 0; i < CACHE_HASH_SIZE; ++i) {
-        cache_entry* prev = nullptr;
-        cache_entry* e    = cache_table[i];
-        while (e) {
-            cache_entry* nxt = e->next;
-            if (difftime(now, e->last_accessed) > cache_timeout) {
-                if (e->dirty) write_back_entry(e);
-                unlink(e->local_path);
-                if (prev) prev->next = nxt;
-                else        cache_table[i] = nxt;
-                free(e->path);
-                free(e->local_path);
-                free(e);
-            } else {
-                prev = e;
+void CacheManager::schedule_prefetch(CacheEntry ce, std::size_t first_blk) {
+    prefetch_pool_.enqueue([this, ce, first_blk]() {
+        for (std::size_t i = 0; i < PREFETCH_WINDOW; ++i) {
+            std::size_t blk = first_blk + i;
+            off_t off       = blk * kBlockSize;
+            char  buf[kBlockSize];
+            if (store_.read(ce.hash_hex, buf, kBlockSize, off) ==
+                static_cast<ssize_t>(kBlockSize))
+                continue;
+            ssize_t got = cache_fs::backend_read_range(
+                            ce.path, buf, kBlockSize, off);
+            if (got > 0) {
+                store_.write(ce.hash_hex, buf, got, off, false);
+                lru_.touch(reinterpret_cast<std::uintptr_t>(
+                            const_cast<CacheEntry*>(&ce))<<32 | blk,
+                        kBlockSize, 0.25);
             }
-            e = nxt;
         }
-    }
-    return 0;
+    });
 }
 
-void cache_cleanup(void) {
-    for (int i = 0; i < CACHE_HASH_SIZE; ++i) {
-        cache_entry* e = cache_table[i];
-        while (e) {
-            cache_entry* nxt = e->next;
-            if (e->dirty) write_back_entry(e);
-            unlink(e->local_path);
-            free(e->path);
-            free(e->local_path);
-            free(e);
-            e = nxt;
-        }
-        cache_table[i] = nullptr;
-    }
-    free(cache_directory);
+static std::unique_ptr<CacheManager> g_cache;
+
+int cache_init(const char* root, int) {
+    try { g_cache = std::make_unique<CacheManager>(root); return 0; }
+    catch (...) { return -1; }
 }
+ssize_t cache_read_file(const char* p, char* b, size_t n, off_t o) {
+    return g_cache ? g_cache->read(p, b, n, o) : -ENODEV;
+}
+int cache_store_file(const char* p, const char* d, size_t n, off_t o) {
+    return g_cache ? g_cache->write(p, d, n, o) : -ENODEV;
+}
+int cache_evict_gb(double gb) {
+    if (!g_cache) return -ENODEV;
+    g_cache->evict_until_gb(gb); 
+    return 0;
+}
+void cache_flush_all() { if (g_cache) g_cache->flush_all(); }
+void cache_cleanup()   { if (g_cache) { g_cache->flush_all(); g_cache.reset(); } }
+
+bool  cache_has_valid_entry(const char*) { return false; }
+void* cache_get_entry(const char*)       { return nullptr; }
+int   cache_apply_eviction()             { return cache_evict_gb(1.0); }
