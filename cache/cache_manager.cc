@@ -54,6 +54,16 @@ public:
     ssize_t write(const std::string& path, const char* buf, std::size_t len, off_t off);
     void   flush_all();
     void   evict_until_gb(double free_gb);
+    bool has_valid_entry(const std::string& path) {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = entries_.find(path);
+        return it != entries_.end() && !it->second.evicted;
+    }
+    CacheEntry* get_entry(const std::string& path) {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = entries_.find(path);
+        return (it != entries_.end() && !it->second.evicted) ? &it->second : nullptr;
+    }
 
 private:
     CacheEntry& entry(const std::string& path);
@@ -221,8 +231,22 @@ int cache_evict_gb(double gb) {
     return 0;
 }
 void cache_flush_all() { if (g_cache) g_cache->flush_all(); }
-void cache_cleanup()   { if (g_cache) { g_cache->flush_all(); g_cache.reset(); } }
-
-bool  cache_has_valid_entry(const char*) { return false; }
-void* cache_get_entry(const char*)       { return nullptr; }
-int   cache_apply_eviction()             { return cache_evict_gb(1.0); }
+void cache_cleanup(void)
+{
+    if (g_cache) {
+        g_cache->flush_all();
+        g_cache.release();
+    }
+}
+bool  cache_has_valid_entry(const char* path)
+{ 
+    return g_cache && g_cache->has_valid_entry(path); 
+}
+void* cache_get_entry(const char* path)
+{ 
+    return g_cache ? static_cast<void*>(g_cache->get_entry(path)) : nullptr; 
+}
+int   cache_apply_eviction(void) 
+{ 
+    return cache_evict_gb(1.0); 
+}
