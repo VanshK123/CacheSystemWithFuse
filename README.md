@@ -121,9 +121,8 @@ This layered design ensures:
 ### Build
 
 ```bash
-git clone <repo>
-mkdir build && cd build
-cmake ..
+git clone https://github.com/VanshK123/ECE670_Project.git
+mkdir ECE670_Project
 make
 ```
 
