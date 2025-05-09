@@ -9,8 +9,6 @@
 #include <unistd.h>
 // for opening and closing directories (opendir, etc.)
 #include <dirent.h>
-// for returning errors to the operating system
-#include <errno.h>
 // needed for strcmp, memset, strcpy, etc.
 #include <string.h>
 // printf, fprintf, and perror
@@ -190,7 +188,7 @@ static int getAttribute(const char* path, struct stat* stbuf, struct fuse_file_i
         string rp = realFilePath(path);
         // .c_str converts a string to const char *
         if (stat(rp.c_str(), stbuf) == -1) {
-            return -errno;
+            return -1;
         } else {
             return 0;
         }
@@ -201,7 +199,7 @@ static int getAttribute(const char* path, struct stat* stbuf, struct fuse_file_i
         off_t fsize;
         if (!get_file_info(path, isDirectory, fsize))
             // return error if file info is not found
-            return -ENOENT;
+            return -1;
         if (isDirectory) {
             stbuf->st_mode = S_IFDIR | 0755;
             stbuf->st_nlink = 2;
@@ -216,14 +214,14 @@ static int getAttribute(const char* path, struct stat* stbuf, struct fuse_file_i
     if (!cache_has_valid_entry(path)) {
         char tmp;
         if (dataBackend->download(path, &tmp, 0, 0) < 0) {
-            return -ENOENT;
+            return -1;
         }
     }
     // get the cache entry pointer
     cache_entry* cacheEntry = cache_get_entry(path);
     if (!cacheEntry) {
         // return error if there is an error with the cache entry
-        return -ENOENT;
+        return -1;
     }
     // gives regular file permissions
     stbuf->st_mode = S_IFREG | 0644;
@@ -237,7 +235,7 @@ static int getStats(const char*, struct statvfs* stbuf) {
 
     if (statvfs(cacheDirectory.c_str(), stbuf) == -1) {
         // returns error
-        return -errno;
+        return -1;
     } else {
         return 0;
     }
@@ -248,7 +246,7 @@ static int readDirectory(const char* path, void* buf, fuse_fill_dir_t filler, of
 
     // if the file path is corrupt, return an error
     if (path != "/") {
-        return -ENOENT;
+        return -1;
     }
 
     // fills in buffer with the following directories
@@ -321,7 +319,7 @@ static int makeDirectory(const char* path, mode_t mode) {
 
     // get real cache path and then perform the make directory function
     if (mkdir(realCachePath(path).c_str(), mode) == -1) {
-        return -errno;
+        return -1;
     }
     return 0;
 
@@ -330,7 +328,7 @@ static int removeDirectory(const char* path) {
 
     // get real cache path and then perform the read directory function
     if (rmdir(realCachePath(path).c_str()) == -1) {
-        return -errno;
+        return -1;
     }
     return 0;
     
@@ -339,7 +337,7 @@ static int removeFile(const char* path) {
 
     // get real cache path and then perform unlink
     if (unlink(realCachePath(path).c_str()) == -1) {
-        return -errno;
+        return -1;
     }
     return 0;
 
@@ -361,7 +359,7 @@ static int readFile(const char* path, char* buf, size_t sz, off_t off, struct fu
         // open file and store file descriptor
         int file = open(rp.c_str(), O_RDONLY);
         if (file < 0) {
-            return -errno;
+            return -1;
         }
         // read from file
         ssize_t numBytes = pread(file, buf, sz, off);
@@ -369,7 +367,7 @@ static int readFile(const char* path, char* buf, size_t sz, off_t off, struct fu
         close(file);
         // cannot be less than zero bytes
         if (numBytes < 0) {
-            return -errno;
+            return -1;
         }
         // cache it too
         cache_store_file(path, buf, numBytes, off);
@@ -379,7 +377,7 @@ static int readFile(const char* path, char* buf, size_t sz, off_t off, struct fu
     // get number of bytes and download the contents of the file
     ssize_t numBytes = dataBackend->download(path, buf, sz, off);
     if (numBytes < 0) {
-        return -EIO;
+        return -1;
     } else {
         return (int)numBytes;
     }
@@ -396,14 +394,14 @@ static int writeFile(const char* path, const char* buf, size_t sz, off_t off, st
         // O_WRONLY opens the file anyway even if it only has write only access
         int file = open(realPath.c_str(), O_CREAT | O_WRONLY, 0644);
         if (file < 0) {
-            return -errno;
+            return -1;
         }
         // write to file
         ssize_t numBytes = pwrite(file, buf, sz, off);
         // close the file
         close(file);
         if (numBytes < 0) {
-            return -errno;
+            return -1;
         } else {
             return (int)numBytes;
         }
@@ -411,7 +409,7 @@ static int writeFile(const char* path, const char* buf, size_t sz, off_t off, st
     // get the number of bytes from the file
     ssize_t numBytes = dataBackend->upload(path, buf, sz, off);
     if (numBytes < 0) {
-        return -EIO;
+        return -1;
     } else {
         return (int)numBytes;
     }
