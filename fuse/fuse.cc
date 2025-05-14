@@ -123,7 +123,7 @@ static void findJsonNames(const string &json, set<string> &out) {
 
 }
 
-static bool get_file_info(const char* path, bool &isDirectory, off_t &size) {
+static bool getFileInfo(const char* path, bool &isDirectory, off_t &size) {
 
     vector<char> buf(1024);
     string filePath = string("/info") + path;
@@ -196,7 +196,7 @@ static int getAttribute(const char* path, struct stat* stbuf, struct fuse_file_i
     if (httpMode) {
         bool isDirectory;
         off_t fsize;
-        if (!get_file_info(path, isDirectory, fsize))
+        if (!getFileInfo(path, isDirectory, fsize))
             // return error if file info is not found
             return -1;
         if (isDirectory) {
