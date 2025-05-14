@@ -66,7 +66,7 @@ static string realCachePath(const char* path) {
     }
 
 }
-// Build file:// remote path: "/foo" → fileRemoteDirectory + "/foo"
+
 static string realFilePath(const char* path) {
 
     // if the input is just a slash, then return the path normally
@@ -87,7 +87,6 @@ static string realFilePath(const char* path) {
 
 }
 
-// --- JSON parsing helpers ---
 static void findJsonNames(const string &json, set<string> &out) {
 
     // initialize position
