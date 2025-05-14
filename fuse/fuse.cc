@@ -461,7 +461,6 @@ int main(int argc, char* argv[]) {
         } else {
             apiBase = url;
         }
-        //string api_base = (pos != -1 ? url.substr(0, pos) + "/api" : url);
         apiBackend = cache_fs::create_backend(apiBase);
         if (!apiBackend) {
             fprintf(stderr, "api backend init failed\n");
