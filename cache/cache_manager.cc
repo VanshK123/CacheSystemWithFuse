@@ -18,7 +18,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <unistd.h>
-
+#include <atomic>
 
 namespace fs = std::filesystem;
 
@@ -39,31 +39,44 @@ struct CacheEntry {
     std::string path;
     std::string hash_hex;
     std::size_t last_block = std::numeric_limits<std::size_t>::max();
-    bool evicted    = false;
+    bool evicted = false;
 };
 
 class CacheManager {
 public:
-    explicit CacheManager(const std::string& root) : store_(root, kBlockSize), meta_("cache_meta.db", root), lru_(kCacheBlocksCapacity), prefetch_pool_(4), root_(root) {
+    explicit CacheManager(const std::string& root) 
+        : store_(root, kBlockSize), meta_("cache_meta.db", root), 
+          lru_(kCacheBlocksCapacity), prefetch_pool_(4), root_(root),
+          cache_hits_(0), cache_misses_(0) {
         store_.init();
         meta_.init();
     }
 
     ssize_t read(const std::string& path, char* buf, std::size_t len, off_t off);
-
     ssize_t write(const std::string& path, const char* buf, std::size_t len, off_t off);
-    void   flush_all();
-    void   evict_until_gb(double free_gb);
+
+    void flush_all();
+    void evict_until_gb(double free_gb);
+    void reset_stats() {
+        cache_hits_ = 0;
+        cache_misses_ = 0;
+    }
+
+
     bool has_valid_entry(const std::string& path) {
         std::lock_guard<std::mutex> g(mu_);
         auto it = entries_.find(path);
         return it != entries_.end() && !it->second.evicted;
     }
+
     CacheEntry* get_entry(const std::string& path) {
         std::lock_guard<std::mutex> g(mu_);
         auto it = entries_.find(path);
         return (it != entries_.end() && !it->second.evicted) ? &it->second : nullptr;
     }
+
+    std::size_t get_cache_hits() const { return cache_hits_.load(); }
+    std::size_t get_cache_misses() const { return cache_misses_.load(); }
 
 private:
     CacheEntry& entry(const std::string& path);
@@ -76,6 +89,9 @@ private:
     ThreadPool prefetch_pool_;
     std::unordered_map<std::string, CacheEntry> entries_;
     std::string root_;
+
+    std::atomic<std::size_t> cache_hits_;
+    std::atomic<std::size_t> cache_misses_;
 };
 
 ssize_t CacheManager::read(const std::string& path, char* buf, std::size_t len, off_t off) {
@@ -86,17 +102,19 @@ ssize_t CacheManager::read(const std::string& path, char* buf, std::size_t len, 
     ssize_t done = 0;
     while (done < static_cast<ssize_t>(len)) {
         std::size_t blk = (off + done) / kBlockSize;
-        off_t blk_off   = blk * kBlockSize;
-        std::size_t in  = (off + done) - blk_off;
-        std::size_t want= std::min<std::size_t>(kBlockSize - in, len - done);
+        off_t blk_off = blk * kBlockSize;
+        std::size_t in = (off + done) - blk_off;
+        std::size_t want = std::min<std::size_t>(kBlockSize - in, len - done);
 
         char block[kBlockSize];
-        bool cached = store_.read(ce.hash_hex, block,kBlockSize, blk_off) == static_cast<ssize_t>(kBlockSize);
-        if (!cached) {
+        bool cached = store_.read(ce.hash_hex, block, kBlockSize, blk_off) == static_cast<ssize_t>(kBlockSize);
+        if (cached) {
+            cache_hits_++;
+        } else {
+            cache_misses_++;
             ssize_t got = cache_fs::backend_read_range(path, block, kBlockSize, blk_off);
             if (got <= 0) {
-                fs::path src = fs::path(root_) /
-                            fs::path(path[0] == '/' ? path.substr(1) : path);
+                fs::path src = fs::path(root_) / fs::path(path[0] == '/' ? path.substr(1) : path);
                 int fd = ::open(src.c_str(), O_RDONLY);
                 if (fd >= 0) {
                     got = ::pread(fd, block, kBlockSize, blk_off);
@@ -109,7 +127,7 @@ ssize_t CacheManager::read(const std::string& path, char* buf, std::size_t len, 
         std::memcpy(buf + done, block + in, want);
         done += want;
 
-        lru_.touch(reinterpret_cast<std::uintptr_t>(&ce)<<32 | blk, kBlockSize, 1.0);
+        lru_.touch(reinterpret_cast<std::uintptr_t>(&ce) << 32 | blk, kBlockSize, 1.0);
 
         bool seq = (ce.last_block != std::numeric_limits<std::size_t>::max()) && (blk == ce.last_block + 1);
         ce.last_block = blk;
@@ -211,42 +229,62 @@ void CacheManager::schedule_prefetch(CacheEntry ce, std::size_t first_blk) {
 
 static std::unique_ptr<CacheManager> g_cache;
 
+extern "C" {
+
+std::size_t cache_get_hits() {
+    return g_cache ? g_cache->get_cache_hits() : 0;
+}
+
+std::size_t cache_get_misses() {
+    return g_cache ? g_cache->get_cache_misses() : 0;
+}
+
+void cache_reset_stats() {
+    if (g_cache) g_cache->reset_stats();
+}
+
 int cache_init(const char* root, int) {
     try { g_cache = std::make_unique<CacheManager>(root); return 0; }
     catch (...) { return -1; }
 }
-int cache_store_file(const char* p, const char* d, size_t len, off_t off)
-{
+
+int cache_store_file(const char* p, const char* d, size_t len, off_t off) {
     if (!g_cache) return -ENODEV;
     ssize_t rc = g_cache->write(p, d, len, off);
     return (rc < 0) ? static_cast<int>(rc) : 0;
 }
-ssize_t cache_read_file(const char* p, char* b, size_t len, off_t off)
-{
+
+ssize_t cache_read_file(const char* p, char* b, size_t len, off_t off) {
     return g_cache ? g_cache->read(p, b, len, off) : -ENODEV;
 }
+
 int cache_evict_gb(double gb) {
     if (!g_cache) return -ENODEV;
-    g_cache->evict_until_gb(gb); 
+    g_cache->evict_until_gb(gb);
     return 0;
 }
-void cache_flush_all() { if (g_cache) g_cache->flush_all(); }
-void cache_cleanup(void)
-{
+
+void cache_flush_all() {
+    if (g_cache) g_cache->flush_all();
+}
+
+void cache_cleanup(void) {
     if (g_cache) {
         g_cache->flush_all();
         g_cache.release();
     }
 }
-bool  cache_has_valid_entry(const char* path)
-{ 
-    return g_cache && g_cache->has_valid_entry(path); 
+
+bool cache_has_valid_entry(const char* path) {
+    return g_cache && g_cache->has_valid_entry(path);
 }
-void* cache_get_entry(const char* path)
-{ 
-    return g_cache ? static_cast<void*>(g_cache->get_entry(path)) : nullptr; 
+
+void* cache_get_entry(const char* path) {
+    return g_cache ? static_cast<void*>(g_cache->get_entry(path)) : nullptr;
 }
-int   cache_apply_eviction(void) 
-{ 
-    return cache_evict_gb(1.0); 
+
+int cache_apply_eviction(void) {
+    return cache_evict_gb(1.0);
 }
+
+} // extern "C"

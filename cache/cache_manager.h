@@ -6,6 +6,10 @@
 #include <stdbool.h>
 #include <sys/types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define CACHE_TABLE_SIZE 1024
 
 typedef struct cache_entry {
@@ -17,6 +21,11 @@ typedef struct cache_entry {
     bool                dirty;
     struct cache_entry* next;
 } cache_entry;
+
+// C-accessible functions (for use with ctypes in Python)
+std::size_t cache_get_hits();
+std::size_t cache_get_misses();
+void cache_reset_stats();
 
 int cache_init(const char* backing_dir, int timeout);
 
@@ -32,4 +41,8 @@ int cache_apply_eviction(void);
 
 void cache_cleanup(void);
 
+#ifdef __cplusplus
+}
 #endif
+
+#endif // CACHE_MANAGER_H

@@ -1,8 +1,18 @@
 import os
 import time
 import matplotlib.pyplot as plt
+import ctypes
 
-SIZES_MB = [10**exp for exp in [0, 1, 1.5, 2, 2.5, 3]]  # MB values: 1, 10, 31.6, 100, 316.2, 1000
+# ------------------- Cache Stats Integration -------------------
+lib = ctypes.CDLL('./libcache.so')
+lib.cache_get_hits.restype = ctypes.c_size_t
+lib.cache_get_misses.restype = ctypes.c_size_t
+lib.cache_reset_stats.restype = None
+
+lib.cache_reset_stats()  # Reset stats before running the test
+
+# ------------------- FUSE Latency Test -------------------------
+SIZES_MB = [10**exp for exp in [0, 1, 1.5, 2, 2.5, 3]]  # MB: 1, 10, 31.6, 100, 316.2, 1000
 SIZES_KB = [int(mb * 1024) for mb in SIZES_MB]
 MOUNT_PATH = "mnt/fuse_test"
 
@@ -51,7 +61,7 @@ for size_kb, size_mb in zip(SIZES_KB, SIZES_MB):
     read_throughput.append(tp)
     print(f"[READ]  {size_mb:>6.1f}MB → {latency_ms:.3f} ms → {tp:.2f} MB/s")
 
-# --- Plot Latency ---
+# ------------------- Plot Latency -------------------------
 plt.figure(figsize=(10, 5))
 plt.plot(SIZES_MB, info_latencies, marker='o', label="INFO (stat)")
 plt.plot(SIZES_MB, read_latencies, marker='o', label="READ (open+read)")
@@ -66,7 +76,7 @@ plt.tight_layout()
 plt.savefig("fuse_latency_plot.png")
 plt.show()
 
-# --- Plot Throughput ---
+# ------------------- Plot Throughput -------------------------
 plt.figure(figsize=(10, 5))
 plt.plot(SIZES_MB, read_throughput, marker='o', label="READ Throughput")
 plt.plot(SIZES_MB, write_throughput, marker='o', label="WRITE Throughput")
@@ -79,3 +89,27 @@ plt.grid(True)
 plt.tight_layout()
 plt.savefig("fuse_throughput_plot.png")
 plt.show()
+
+# ------------------- Plot Cache Hit/Miss -------------------------
+hits = lib.cache_get_hits()
+misses = lib.cache_get_misses()
+total = hits + misses
+
+print(f"\nCache stats: {hits} hits, {misses} misses")
+
+if total > 0 and (hits > 0 or misses > 0):
+    hit_rate = (hits / total * 100)
+    miss_rate = (misses / total * 100)
+
+    labels = ['Cache Hits', 'Cache Misses']
+    sizes = [hit_rate, miss_rate]
+
+    fig, ax = plt.subplots()
+    ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+    ax.axis('equal')
+    plt.title("Cache Hit vs Miss Ratio")
+    plt.tight_layout()
+    plt.savefig("cache_hit_miss_plot.png")
+    plt.show()
+else:
+    print("No cache accesses recorded (hits + misses = 0), skipping pie chart.")

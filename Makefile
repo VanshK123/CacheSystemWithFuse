@@ -36,10 +36,11 @@ FUSE_SRC     := fuse/fuse.cc
 # ---------------------------------------------------------------
 TESTS := test_cache test_eviction test_read test_http
 BIN    := remote_cache
+LIB    := libcache.so
 
 .PHONY: all test clean
 
-all: $(BIN) $(TESTS)
+all: $(BIN) $(TESTS) $(LIB)
 
 # ---- unit tests ------------------------------------------------
 test_cache:    $(CACHE_SRCS) $(BACKEND_SRCS) test_cache.cc
@@ -51,13 +52,17 @@ test_eviction: $(CACHE_SRCS) $(BACKEND_SRCS) test_eviction.cc
 test_read:     $(CACHE_SRCS) $(BACKEND_SRCS) test_read.cc
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ $(LIBCURL) $(LIBSQLITE) $(LIBPTHREAD) -o $@
 
-
 test_http: $(CACHE_SRCS) $(BACKEND_SRCS) test_http.cc
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ $(LIBCURL) $(LIBSQLITE) $(LIBPTHREAD) -o $@
 
 # ---- main CLI/FUSE binary -------------------------------------
 remote_cache: $(CACHE_SRCS) $(BACKEND_SRCS) $(FUSE_SRC)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ $(LIBCURL) $(LIBSQLITE) $(LIBFUSE) -o $@
+
+# ---- shared library -------------------------------------------
+libcache.so: $(CACHE_SRCS) $(BACKEND_SRCS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -fPIC -shared $^ $(LIBCURL) $(LIBSQLITE) $(LIBPTHREAD) -o $@
+
 
 # ---------------------------------------------------------------
 # Convenience targets
@@ -75,5 +80,6 @@ test: all
 	./test_fuse.sh
 
 clean:
-	-rm -f $(BIN) $(TESTS)
+	-rm -f $(BIN) $(TESTS) $(LIB)
 	-rm -rf cache_dir mnt/fuse_test
+
